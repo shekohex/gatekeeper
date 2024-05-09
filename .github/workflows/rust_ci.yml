@@ -10,6 +10,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  WIFI_SSID: "root"
+  WIFI_PASS: "root"
+  DEVICE_IP: 192.168.1.47
+  GATEWAY_IP: 192.168.1.1
+  GATEWAY_MASK: 24
 
 jobs:
   rust-checks:
