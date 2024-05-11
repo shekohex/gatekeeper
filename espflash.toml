@@ -1,0 +1,8 @@
+baudrate = 460800
+
+[flash]
+size = "16MB"
+frequency = "80MHz"
+
+[connection]
+serial = "/dev/cu.usbserial-210"
