@@ -1,15 +1,16 @@
+use core::net::Ipv4Addr;
 use core::str::FromStr;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::net::Ipv4Addr;
 use parking_lot::RwLock;
+use std::thread::JoinHandle;
 
 use esp_idf_svc::eventloop::*;
-use esp_idf_svc::hal::gpio::*;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::hal::peripherals::*;
 use esp_idf_svc::hal::reset;
 use esp_idf_svc::hal::task::*;
 use esp_idf_svc::hal::timer::*;
+use esp_idf_svc::hal::{gpio::*, task};
 use esp_idf_svc::http;
 use esp_idf_svc::ipv4;
 use esp_idf_svc::netif::*;
@@ -29,6 +30,8 @@ const WIFI_CHANNEL: Option<&str> = option_env!("WIFI_AP_CHANNEL");
 
 // Need lots of stack to parse JSON
 const STACK_SIZE: usize = 10240;
+
+const WEB_PORTAL: &str = include_str!(concat!(env!("OUT_DIR"), "/out.html"));
 
 /// AtomicBool to control the running state of the server
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -73,6 +76,7 @@ fn main() -> anyhow::Result<()> {
         let state = RwLock::new(gatekeeper);
 
         let _http_server = start_http_server(state)?;
+        let _captive_portal_dns = start_dns_captive_portal()?;
 
         wifi.wifi_wait(|_| Ok(RUNNING.load(Ordering::SeqCst)), None)
             .await?;
@@ -107,8 +111,8 @@ fn configure_ap(modem: Modem, sys_loop: EspSystemEventLoop) -> anyhow::Result<Es
                     mask: ipv4::Mask(netmask),
                 },
                 dhcp_enabled: true,
-                dns: Some(Ipv4Addr::from([1, 1, 1, 1])),
-                secondary_dns: Some(Ipv4Addr::from([1, 1, 0, 0])),
+                dns: Some(gateway_addr),
+                secondary_dns: None,
             }),
             ..NetifConfiguration::wifi_default_router()
         })?,
@@ -156,20 +160,97 @@ fn start_http_server(
         ..Default::default()
     };
     let mut server = http::server::EspHttpServer::new(&conf)?;
-    server.fn_handler("/", Method::Get, |request| {
-        request
-            .into_ok_response()?
-            .write_all(b"<html><body>Hello world!</body></html>")
-    })?;
+    server
+        .fn_handler("/", Method::Get, |request| {
+            request.into_ok_response()?.write_all(WEB_PORTAL.as_bytes())
+        })?
+        .fn_handler("/generate_204", Method::Get, |request| {
+            request.into_ok_response()?.write_all(WEB_PORTAL.as_bytes())
+        })?
+        .fn_handler("/gen_204", Method::Get, |request| {
+            request.into_ok_response()?.write_all(WEB_PORTAL.as_bytes())
+        })?
+        .fn_handler::<anyhow::Error, _>("/open", Method::Post, move |mut request| {
+            let mut lock = gatekeeper.write();
+            let buf = &mut [0u8; 512];
+            let len = request.read(buf)?;
+            log::info!("Received POST request: {len} bytes");
+            let body = core::str::from_utf8(&buf[..len])?;
+            log::info!("Opening door: {body}");
 
-    server.fn_handler("/toggle", Method::Get, move |request| {
-        let mut lock = gatekeeper.write();
-        if lock.on_chip_led.is_set_high() {
-            lock.on_chip_led.set_low()?;
-        } else {
             lock.on_chip_led.set_high()?;
-        }
-        request.into_ok_response()?.flush()
-    })?;
+            std::thread::sleep(core::time::Duration::from_secs(2));
+            lock.on_chip_led.set_low()?;
+            let res = match request.into_ok_response() {
+                Ok(mut res) => res.write_all(b"{}"),
+                Err(e) => {
+                    log::error!("Error responding to request: {e}");
+                    return Ok(());
+                }
+            };
+            if let Err(e) = res {
+                log::error!("Error writing to response: {e}");
+            }
+            Ok(())
+        })?;
     Ok(server)
+}
+
+fn start_dns_captive_portal() -> anyhow::Result<CaptivePortalDns> {
+    const STACK_SIZE: usize = 16 * 1024;
+    task::thread::ThreadSpawnConfiguration {
+        stack_size: 16 * 1024,
+        priority: 5,
+        ..Default::default()
+    }
+    .set()?;
+    let thread_handle = std::thread::Builder::new()
+        .name("dns_server".to_string())
+        .stack_size(STACK_SIZE)
+        .spawn(dns_server_task)?;
+    let captive_portal_dns = CaptivePortalDns {
+        thread_handle: Some(thread_handle),
+    };
+    Ok(captive_portal_dns)
+}
+
+pub struct CaptivePortalDns {
+    thread_handle: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl Drop for CaptivePortalDns {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread_handle.take() {
+            // abort the thread
+            handle.join().unwrap().unwrap();
+        }
+    }
+}
+
+fn dns_server_task() -> anyhow::Result<()> {
+    let gateway_addr = Ipv4Addr::from_str(GATEWAY_IP)?;
+    let ttl = core::time::Duration::from_secs(300);
+    let addr = core::net::SocketAddr::new(core::net::Ipv4Addr::UNSPECIFIED.into(), 53);
+    let udp_socket = std::net::UdpSocket::bind(addr)?;
+    log::info!("DNS server listening on {addr}...");
+    let mut tx_buf = [0u8; 512];
+    let mut rx_buf = [0u8; 512];
+    loop {
+        let (len, src) = udp_socket.recv_from(&mut rx_buf)?;
+        let request = &mut rx_buf[..len];
+        log::debug!("Received DNS request from {src}...");
+        let len = match edge_captive::reply(request, &gateway_addr.octets(), ttl, &mut tx_buf) {
+            Ok(len) => len,
+            Err(e) => match e {
+                edge_captive::DnsError::InvalidMessage => {
+                    log::warn!("Got invalid DNS message from {src}, skipping...");
+                    continue;
+                }
+                other => anyhow::bail!("DNSError: {}", other.to_string()),
+            },
+        };
+
+        udp_socket.send_to(&tx_buf[..len], src)?;
+        log::debug!("Sent DNS response to {src}");
+    }
 }
