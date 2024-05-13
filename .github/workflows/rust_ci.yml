@@ -10,10 +10,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  WIFI_SSID: "root"
-  WIFI_PASS: "root"
-  DEVICE_IP: 192.168.1.47
-  GATEWAY_IP: 192.168.1.1
+  WIFI_AP_SSID: "Gatekeeper"
+  WIFI_AP_PASS: "password"
+  WIFI_AP_CHANNEL: 11
+  GATEWAY_IP: "192.168.1.1"
   GATEWAY_MASK: 24
 
 jobs:
